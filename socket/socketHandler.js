@@ -1,4 +1,4 @@
-// backend/socket/socketHandler.js
+// backend/socket/socketHandler.js (UPDATED with Timer & Run/Submit)
 const Room = require('../models/Room');
 const User = require('../models/User');
 const Result = require('../models/Result');
@@ -8,6 +8,7 @@ const { runTestCases } = require('../utils/judge0');
 module.exports = (io) => {
   // Store active rooms in memory for quick access
   const activeRooms = new Map();
+  const roomTimers = new Map(); // Store timer intervals
 
   io.on('connection', (socket) => {
     console.log(`✅ User connected: ${socket.id}`);
@@ -15,7 +16,6 @@ module.exports = (io) => {
     // Join a room
     socket.on('joinRoom', async ({ roomId, userId, username }) => {
       try {
-        // Find room in database
         const room = await Room.findOne({ roomId });
 
         if (!room) {
@@ -33,13 +33,11 @@ module.exports = (io) => {
           return;
         }
 
-        // Check if user already in room
         const existingPlayer = room.players.find(
           p => p.userId.toString() === userId
         );
 
         if (!existingPlayer) {
-          // Add player to room
           room.players.push({
             userId,
             username,
@@ -48,20 +46,23 @@ module.exports = (io) => {
           });
           await room.save();
         } else {
-          // Update socket ID if player reconnects
           existingPlayer.socketId = socket.id;
           await room.save();
         }
 
-        // Join socket room
         socket.join(roomId);
-
-        // Store room info in socket
         socket.roomId = roomId;
         socket.userId = userId;
         socket.username = username;
 
-        // Send current room state to the joining user
+        // Get remaining time if battle is active
+        let remainingTime = null;
+        if (room.status === 'active' && activeRooms.has(roomId)) {
+          const roomData = activeRooms.get(roomId);
+          const elapsed = Date.now() - roomData.startTime;
+          remainingTime = Math.max(0, Math.floor((roomData.duration - elapsed) / 1000));
+        }
+
         socket.emit('roomJoined', {
           roomId: room.roomId,
           host: room.host.toString(),
@@ -71,10 +72,11 @@ module.exports = (io) => {
             socketId: p.socketId
           })),
           status: room.status,
-          question: room.question
+          question: room.question,
+          duration: room.duration || 1200, // Default 20 minutes
+          remainingTime
         });
 
-        // Notify all users in room about new player
         io.to(roomId).emit('playerJoined', {
           userId,
           username,
@@ -91,8 +93,8 @@ module.exports = (io) => {
       }
     });
 
-    // Start the battle (only host can start)
-    socket.on('startBattle', async ({ roomId, userId }) => {
+    // Start the battle with timer
+    socket.on('startBattle', async ({ roomId, userId, duration = 1200 }) => {
       try {
         const room = await Room.findOne({ roomId });
 
@@ -101,7 +103,6 @@ module.exports = (io) => {
           return;
         }
 
-        // Check if user is host
         if (room.host.toString() !== userId) {
           socket.emit('error', { message: 'Only host can start the battle' });
           return;
@@ -123,14 +124,17 @@ module.exports = (io) => {
         // Update room
         room.status = 'active';
         room.question = question;
+        room.duration = duration;
         room.startedAt = new Date();
         await room.save();
 
-        // Store in active rooms
+        // Store in active rooms with player submissions tracking
         activeRooms.set(roomId, {
           startTime: Date.now(),
+          duration: duration * 1000, // Convert to milliseconds
           question,
-          submissions: new Map()
+          submissions: new Map(), // userId -> { testResults, lastRun, submitted }
+          finishedPlayers: new Set()
         });
 
         // Emit question to all players
@@ -142,29 +146,24 @@ module.exports = (io) => {
             description: question.description,
             examples: question.examples,
             starterCode: question.starterCode,
-            testCases: question.testCases.map(tc => ({ input: tc.input })) // Don't send expected output
-          }
+            testCases: question.testCases.map(tc => ({ input: tc.input }))
+          },
+          duration: duration, // in seconds
+          startTime: Date.now()
         });
 
-        console.log(`🎮 Battle started in room: ${roomId}`);
+        // Start countdown timer
+        startBattleTimer(io, roomId, duration);
+
+        console.log(`🎮 Battle started in room: ${roomId} (Duration: ${duration}s)`);
       } catch (error) {
         console.error('Start battle error:', error);
         socket.emit('error', { message: 'Failed to start battle' });
       }
     });
 
-    // Code change (broadcast to other players)
-    socket.on('codeChange', ({ roomId, code, language }) => {
-      socket.to(roomId).emit('codeUpdated', {
-        userId: socket.userId,
-        username: socket.username,
-        code,
-        language
-      });
-    });
-
-    // Submit code for testing
-    socket.on('submitCode', async ({ roomId, code, language }) => {
+    // Run code (test without submitting)
+    socket.on('runCode', async ({ roomId, code, language }) => {
       try {
         const room = await Room.findOne({ roomId });
 
@@ -173,11 +172,12 @@ module.exports = (io) => {
           return;
         }
 
-        // Notify room that user is submitting
-        io.to(roomId).emit('userSubmitting', {
-          userId: socket.userId,
-          username: socket.username
-        });
+        if (room.status !== 'active') {
+          socket.emit('error', { message: 'Battle is not active' });
+          return;
+        }
+
+        socket.emit('codeRunning', { message: 'Running your code...' });
 
         // Run code against test cases
         const results = await runTestCases(
@@ -186,8 +186,24 @@ module.exports = (io) => {
           room.question.testCases
         );
 
-        // Send results back to the user
-        socket.emit('submissionResult', {
+        // Store last run results
+        const activeRoom = activeRooms.get(roomId);
+        if (activeRoom) {
+          if (!activeRoom.submissions.has(socket.userId)) {
+            activeRoom.submissions.set(socket.userId, {
+              testResults: results,
+              lastRun: Date.now(),
+              submitted: false
+            });
+          } else {
+            const submission = activeRoom.submissions.get(socket.userId);
+            submission.testResults = results;
+            submission.lastRun = Date.now();
+          }
+        }
+
+        // Send results back to the user only
+        socket.emit('runResult', {
           success: results.success,
           allPassed: results.allPassed,
           results: results.results,
@@ -195,79 +211,77 @@ module.exports = (io) => {
           passedTests: results.passedTests
         });
 
-        // If all tests passed and no winner yet
-        if (results.allPassed && room.status === 'active') {
-          const activeRoom = activeRooms.get(roomId);
-          
-          // Check if this is the first correct submission
-          if (!activeRoom.submissions.has('winner')) {
-            activeRoom.submissions.set('winner', socket.userId);
+        console.log(`🔍 ${socket.username} ran code in room: ${roomId}`);
+      } catch (error) {
+        console.error('Run code error:', error);
+        socket.emit('error', { 
+          message: 'Code execution failed. Please try again.' 
+        });
+      }
+    });
 
-            // Update room
-            room.status = 'finished';
-            room.winner = socket.userId;
-            room.finishedAt = new Date();
-            await room.save();
+    // Submit code (final submission)
+    socket.on('submitCode', async ({ roomId }) => {
+      try {
+        const room = await Room.findOne({ roomId });
 
-            // Calculate duration
-            const duration = Math.floor((Date.now() - activeRoom.startTime) / 1000);
+        if (!room || !room.question) {
+          socket.emit('error', { message: 'Invalid room or no active question' });
+          return;
+        }
 
-            // Update user stats
-            const winner = await User.findById(socket.userId);
-            if (winner) {
-              winner.totalBattles += 1;
-              winner.wins += 1;
-              winner.points += 100; // Award 100 points for winning
-              await winner.save();
-            }
+        if (room.status !== 'active') {
+          socket.emit('error', { message: 'Battle is not active' });
+          return;
+        }
 
-            // Update losers' stats
-            for (const player of room.players) {
-              if (player.userId.toString() !== socket.userId) {
-                const loser = await User.findById(player.userId);
-                if (loser) {
-                  loser.totalBattles += 1;
-                  loser.losses += 1;
-                  loser.points += 10; // Participation points
-                  await loser.save();
-                }
-              }
-            }
+        const activeRoom = activeRooms.get(roomId);
+        if (!activeRoom) {
+          socket.emit('error', { message: 'Battle session not found' });
+          return;
+        }
 
-            // Save result
-            const result = new Result({
-              room: room._id,
-              winner: socket.userId,
-              participants: room.players.map(p => ({
-                user: p.userId,
-                submissionTime: p.userId.toString() === socket.userId ? new Date() : null,
-                passed: p.userId.toString() === socket.userId
-              })),
-              question: room.question,
-              duration
-            });
-            await result.save();
+        // Get last run results
+        const userSubmission = activeRoom.submissions.get(socket.userId);
+        
+        if (!userSubmission || !userSubmission.testResults) {
+          socket.emit('error', { 
+            message: 'Please run your code at least once before submitting' 
+          });
+          return;
+        }
 
-            // Announce winner to all players
-            io.to(roomId).emit('battleEnded', {
-              winner: {
-                userId: socket.userId,
-                username: socket.username
-              },
-              duration,
-              roomId
-            });
+        // Mark as submitted
+        userSubmission.submitted = true;
+        userSubmission.submittedAt = Date.now();
+        activeRoom.finishedPlayers.add(socket.userId);
 
-            // Clean up active room
-            activeRooms.delete(roomId);
+        // Navigate user to waiting page
+        socket.emit('submissionAccepted', {
+          message: 'Submission recorded! Waiting for others...',
+          testResults: userSubmission.testResults,
+          passedTests: userSubmission.testResults.passedTests,
+          totalTests: userSubmission.testResults.totalTests
+        });
 
-            console.log(`🏆 ${socket.username} won the battle in room: ${roomId}`);
-          }
+        // Notify all players
+        io.to(roomId).emit('playerSubmitted', {
+          userId: socket.userId,
+          username: socket.username,
+          finishedCount: activeRoom.finishedPlayers.size,
+          totalPlayers: room.players.length
+        });
+
+        console.log(`📝 ${socket.username} submitted in room: ${roomId}`);
+
+        // Check if all players have submitted
+        if (activeRoom.finishedPlayers.size === room.players.length) {
+          endBattle(io, roomId);
         }
       } catch (error) {
         console.error('Submit code error:', error);
         socket.emit('error', { 
-          message: 'Code execution failed. Please try again.' 
+          message: 'Submission failed. Please try again.' 
         });
       }
     });
@@ -287,7 +301,6 @@ module.exports = (io) => {
       console.log(`❌ User disconnected: ${socket.id}`);
 
       if (socket.roomId) {
-        // Notify room that user left
         io.to(socket.roomId).emit('playerLeft', {
           userId: socket.userId,
           username: socket.username
@@ -306,12 +319,138 @@ module.exports = (io) => {
 
       socket.roomId = null;
     });
-
-    // Error handling
-    socket.on('error', (error) => {
-      console.error('Socket error:', error);
-    });
   });
 
-  console.log('🔌 Socket.IO handler initialized');
+  // Start battle timer
+  function startBattleTimer(io, roomId, duration) {
+    let remainingTime = duration;
+
+    const interval = setInterval(() => {
+      remainingTime--;
+
+      // Emit time update every second
+      io.to(roomId).emit('timerUpdate', { remainingTime });
+
+      // Time's up!
+      if (remainingTime <= 0) {
+        clearInterval(interval);
+        roomTimers.delete(roomId);
+        endBattle(io, roomId);
+      }
+    }, 1000);
+
+    roomTimers.set(roomId, interval);
+  }
+
+  // End battle and calculate results
+  async function endBattle(io, roomId) {
+    try {
+      const room = await Room.findOne({ roomId });
+      const activeRoom = activeRooms.get(roomId);
+
+      if (!room || !activeRoom) return;
+
+      // Calculate scores and determine winner
+      let highestScore = -1;
+      let winnerId = null;
+      const playerScores = [];
+
+      for (const [userId, submission] of activeRoom.submissions) {
+        const score = submission.testResults?.passedTests || 0;
+        const player = room.players.find(p => p.userId.toString() === userId);
+
+        playerScores.push({
+          userId,
+          username: player?.username || 'Unknown',
+          score,
+          totalTests: submission.testResults?.totalTests || 0,
+          submitted: submission.submitted,
+          submittedAt: submission.submittedAt
+        });
+
+        if (submission.submitted && score > highestScore) {
+          highestScore = score;
+          winnerId = userId;
+        } else if (submission.submitted && score === highestScore && winnerId) {
+          // Tie-breaker: who submitted first
+          const currentWinner = activeRoom.submissions.get(winnerId);
+          if (submission.submittedAt < currentWinner.submittedAt) {
+            winnerId = userId;
+          }
+        }
+      }
+
+      // Update room status
+      room.status = 'finished';
+      room.winner = winnerId;
+      room.finishedAt = new Date();
+      await room.save();
+
+      // Update user stats
+      for (const playerScore of playerScores) {
+        const user = await User.findById(playerScore.userId);
+        if (user) {
+          user.totalBattles += 1;
+          
+          if (playerScore.userId === winnerId) {
+            user.wins += 1;
+            user.points += 100; // Winner points
+          } else {
+            user.losses += 1;
+            // Award participation points based on score
+            const participationPoints = Math.floor((playerScore.score / playerScore.totalTests) * 50);
+            user.points += Math.max(10, participationPoints);
+          }
+          
+          await user.save();
+        }
+      }
+
+      // Save result
+      const duration = Math.floor((Date.now() - activeRoom.startTime) / 1000);
+      const result = new Result({
+        room: room._id,
+        winner: winnerId,
+        participants: playerScores.map(ps => ({
+          user: ps.userId,
+          submissionTime: ps.submittedAt ? new Date(ps.submittedAt) : null,
+          passed: ps.userId === winnerId,
+          score: ps.score,
+          totalTests: ps.totalTests
+        })),
+        question: room.question,
+        duration
+      });
+      await result.save();
+
+      // Find winner details
+      const winner = playerScores.find(ps => ps.userId === winnerId);
+
+      // Announce results to all players
+      io.to(roomId).emit('battleEnded', {
+        winner: winner ? {
+          userId: winner.userId,
+          username: winner.username,
+          score: winner.score,
+          totalTests: winner.totalTests
+        } : null,
+        playerScores: playerScores.sort((a, b) => b.score - a.score),
+        duration,
+        roomId
+      });
+
+      // Clean up
+      activeRooms.delete(roomId);
+      if (roomTimers.has(roomId)) {
+        clearInterval(roomTimers.get(roomId));
+        roomTimers.delete(roomId);
+      }
+
+      console.log(`🏁 Battle ended in room: ${roomId}`);
+    } catch (error) {
+      console.error('End battle error:', error);
+    }
+  }
+
+  console.log('🔌 Socket.IO handler initialized with timer support');
 };
