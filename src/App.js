@@ -1,11 +1,11 @@
-// frontend/src/App.js
 import React from 'react';
 import { BrowserRouter as Router, Routes, Route, Navigate } from 'react-router-dom';
 import { AuthProvider } from './context/AuthContext';
 import Login from './pages/Login';
 import Register from './pages/Register';
 import Dashboard from './pages/Dashboard';
-import Room from './pages/Room';
+import Lobby from './pages/Lobby';
+import Battle from './pages/Battle';
 import Leaderboard from './pages/Leaderboard';
 import Result from './pages/Result';
 import Navbar from './components/Navbar';
@@ -37,7 +37,15 @@ function App() {
               path="/room/:roomId" 
               element={
                 <ProtectedRoute>
-                  <Room />
+                  <Lobby />
+                </ProtectedRoute>
+              } 
+            />
+            <Route 
+              path="/battle/:roomId" 
+              element={
+                <ProtectedRoute>
+                  <Battle />
                 </ProtectedRoute>
               } 
             />
